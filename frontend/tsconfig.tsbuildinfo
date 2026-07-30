@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/vite-env.d.ts","./src/components/diffview.tsx","./src/components/providersidebar.tsx","./src/components/residencystatuscard.tsx","./src/components/sourcetable.tsx","./src/components/tokengate.tsx","./src/components/versionhistorypanel.tsx","./src/hooks/useadmintoken.ts","./src/lib/api.ts"],"version":"5.9.3"}

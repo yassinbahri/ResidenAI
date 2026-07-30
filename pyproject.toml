@@ -1,0 +1,28 @@
+[project]
+name = "residency-tracker"
+version = "0.1.0"
+description = "Internal-only AI provider data-residency/compliance tracker (not exposed to ShadowAI tenants)"
+requires-python = ">=3.12"
+dependencies = [
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "psycopg[binary]>=3.2",
+    "pydantic-settings>=2.6",
+    "httpx>=0.27",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.3",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]

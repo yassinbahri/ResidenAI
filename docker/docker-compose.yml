@@ -1,0 +1,61 @@
+name: residency-tracker
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: residency
+      POSTGRES_PASSWORD: residency
+      POSTGRES_DB: residency_tracker
+    ports:
+      # Deliberately not 5432 - this must never share a port, volume, or
+      # database with the ShadowAI product stack (docker/docker-compose.yml
+      # in the repo root).
+      - "5433:5432"
+    volumes:
+      - residency_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U residency -d residency_tracker"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg://residency:residency@postgres:5432/residency_tracker
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?set ADMIN_TOKEN in docker/.env, see docker/.env.example}
+      DASHBOARD_ORIGINS: ${DASHBOARD_ORIGINS:-["http://localhost:5174"]}
+    ports:
+      - "8100:8100"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  scheduler:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: ["python", "scripts/scheduler_loop.py"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://residency:residency@postgres:5432/residency_tracker
+      SCHEDULER_INTERVAL_SECONDS: ${SCHEDULER_INTERVAL_SECONDS:-900}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8100}
+    ports:
+      - "5174:80"
+    depends_on:
+      - api
+
+volumes:
+  residency_postgres_data:
