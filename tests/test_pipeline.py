@@ -11,7 +11,13 @@ from app.models.provider import Provider
 from app.models.source import Source
 from app.models.source_observation import SourceObservation
 from app.tracker.fetch import FetchResult
-from app.tracker.run import check_source, due_sources, freshness_state, run_due_checks
+from app.tracker.run import (
+    check_source,
+    due_sources,
+    freshness_state,
+    reevaluate_product_residency,
+    run_due_checks,
+)
 from app.tracker.seed_sources import upsert_seed_registry
 
 
@@ -364,6 +370,45 @@ def test_domicile_evaluation_uses_legal_notice_sources() -> None:
             provider = db.get(Provider, provider_id)
             assert provider.eu_domicile_status == "eu_domiciled"
             assert provider.eu_domicile_evidence_char_start is not None
+        finally:
+            _cleanup(db, provider_id)
+
+
+def test_residency_evidence_attribution_is_deterministic_across_sources() -> None:
+    """Two sources both stating a residency claim must always credit the same
+    one. The classifier takes the first match across sources, so without an
+    ORDER BY the evidence quote and linked source could flip between identical
+    runs on whatever order Postgres returned - phantom churn in the audit
+    trail this tool exists to provide. Lowest source_key wins."""
+    with SessionLocal() as db:
+        source_a = _make_provider_source(db)
+        provider_id = source_a.provider_id
+        source_a.source_key = "a-docs"
+        source_z = Source(
+            provider_id=provider_id,
+            product_id=source_a.product_id,
+            source_key="z-docs",
+            canonical_url="https://example.test/z-docs",
+            authority="official_product_documentation",
+        )
+        db.add(source_z)
+        db.commit()
+
+        try:
+            body = "<main><p>Data is processed in the EU for all customers.</p></main>"
+            check_source(db, source_z, FakeFetcher([_success_result(body)]))
+            check_source(db, source_a, FakeFetcher([_success_result(body)]))
+
+            product = db.get(Product, source_a.product_id)
+            db.refresh(product)
+            assert product.eu_eea_status == "available"
+            assert product.eu_eea_evidence_source_id == source_a.id
+
+            # Re-running from already-captured content must not move it.
+            reevaluate_product_residency(db, product.id)
+            db.commit()
+            db.refresh(product)
+            assert product.eu_eea_evidence_source_id == source_a.id
         finally:
             _cleanup(db, provider_id)
 

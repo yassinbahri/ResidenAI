@@ -85,8 +85,16 @@ def reevaluate_product_residency(db: Session, product_id) -> None:
     if product is None:
         return
 
+    # Ordered by source_key: the classifiers return the *first* non-negated
+    # match across sources, so without a deterministic order two sources that
+    # both state a residency claim would credit whichever one Postgres happened
+    # to return first - the verdict stays the same but the evidence quote and
+    # linked source could change between otherwise identical runs, showing up
+    # as phantom churn in the audit trail this tool exists to provide.
     sources = db.execute(
-        select(Source).where(Source.product_id == product_id, Source.enabled.is_(True))
+        select(Source)
+        .where(Source.product_id == product_id, Source.enabled.is_(True))
+        .order_by(Source.source_key)
     ).scalars().all()
 
     texts_by_source_key: dict[str, str] = {}
@@ -128,11 +136,14 @@ def reevaluate_provider_domicile(db: Session, provider_id) -> None:
 
     sources = (
         db.execute(
-            select(Source).where(
+            select(Source)
+            .where(
                 Source.provider_id == provider_id,
                 Source.enabled.is_(True),
                 Source.source_class.in_(["legal_notice", "trust_center"]),
             )
+            # Deterministic evidence attribution - see reevaluate_product_residency.
+            .order_by(Source.source_key)
         )
         .scalars()
         .all()

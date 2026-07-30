@@ -60,6 +60,47 @@ def test_third_person_legal_imprint_recognized_via_provider_name() -> None:
     assert result.status == "eu_domiciled"
 
 
+def test_us_street_address_quadrant_is_not_read_as_societas_europaea() -> None:
+    # "SE" is both the EU-only Societas Europaea legal form and the standard US
+    # postal quadrant abbreviation. A bare "<word> SE," pattern matched "1201
+    # Broad Street SE, Atlanta, Georgia" and classified US vendors as
+    # EU-domiciled off their own postal address - overstating compliance, which
+    # this classifier is specifically built never to do.
+    result = classify_eu_domicile(
+        {
+            "legal_notice": (
+                "Acme Analytics, Inc. Our principal office is located at "
+                "1201 Broad Street SE, Atlanta, Georgia 30303. "
+                "Acme is committed to protecting your data."
+            )
+        },
+        provider_name="Acme Analytics",
+    )
+    assert result.status == "unclear"
+
+
+def test_other_street_type_abbreviations_before_se_are_also_rejected() -> None:
+    for address in (
+        "900 SE Belmont St SE, Portland, Oregon.",
+        "Our address is 400 Main Ave SE. Call us.",
+        "Located at 12 Oak Rd SE, Washington DC.",
+        "1000 Market Dr SE, Salem.",
+    ):
+        result = classify_eu_domicile({"legal_notice": address}, provider_name="Acme")
+        assert result.status == "unclear", address
+
+
+def test_genuine_societas_europaea_names_still_match() -> None:
+    # The address fix must not cost us the real signal it guards.
+    for text, name in (
+        ("Allianz SE. Registered in Munich.", "Allianz"),
+        ("Airbus SE is headquartered in Leiden.", "Airbus"),
+        ("Zalando SE, Berlin.", "Zalando"),
+    ):
+        result = classify_eu_domicile({"imprint": text}, provider_name=name)
+        assert result.status == "eu_domiciled", text
+
+
 def test_third_person_phrasing_without_provider_name_is_unclear() -> None:
     # Without a provider_name hint, third-person phrasing has no
     # self-reference signal to anchor on - correctly stays unclear rather

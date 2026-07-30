@@ -15,6 +15,10 @@ before SELECTABLE before AVAILABLE. An explicit denial is a strong,
 unambiguous signal and is checked first on purpose - a false "available"
 claim is more harmful to a compliance user than missing a subtler positive
 statement, matching this project's stance of never overstating compliance.
+
+The same stance is why positive matches are additionally filtered for
+forward-looking phrasing (see text_matching.is_forward_looking): a roadmap
+promise reads as a capability claim to a regex but is not one in fact.
 """
 
 from __future__ import annotations
@@ -25,7 +29,17 @@ from dataclasses import dataclass
 from app.tracker.text_matching import find_match
 
 _NOT_AVAILABLE_PATTERNS = [
-    re.compile(r"not (?:currently )?available (?:in|within) (?:the )?(?:eu\b|europe|european union|eea)", re.I),
+    # "never" and an optional "be" alongside "not": the original
+    # "not available in ..." shape missed both future-tense denials a vendor
+    # actually writes - "will not be available in the EU" fell through to
+    # "unclear", and "will never be available in Europe" was matched by the
+    # "available in europe" positive pattern instead and reported as
+    # AVAILABLE, turning an explicit denial into a compliance claim.
+    re.compile(
+        r"(?:not|never)\s+(?:currently\s+)?(?:be\s+)?available\s+(?:in|within)\s+"
+        r"(?:the )?(?:eu\b|europe|european union|eea)",
+        re.I,
+    ),
     re.compile(r"do(?:es)? not (?:currently )?offer[^.]{0,40}(?:eu\b|europe|european union|eea)", re.I),
     re.compile(r"only available in the united states", re.I),
     re.compile(r"\bus[- ]only\b", re.I),
@@ -63,12 +77,17 @@ def classify_eu_eea_residency(texts_by_source_key: dict[str, str]) -> ResidencyA
     """texts_by_source_key: normalized_content of the *latest* document
     version for every source belonging to one product, keyed by
     source_key. Empty dict (no content captured yet) returns "unclear"."""
-    for patterns, status in (
-        (_NOT_AVAILABLE_PATTERNS, "not_available"),
-        (_SELECTABLE_PATTERNS, "selectable"),
-        (_AVAILABLE_PATTERNS, "available"),
+    # skip_forward_looking is set for the two positive verdicts only: a vendor
+    # that "plans to offer" or has EU residency "coming soon" does not have it
+    # today, and recording that as available/selectable overstates compliance.
+    # An explicit denial stays a denial however it is tensed, so
+    # not_available deliberately does not skip these.
+    for patterns, status, skip_future in (
+        (_NOT_AVAILABLE_PATTERNS, "not_available", False),
+        (_SELECTABLE_PATTERNS, "selectable", True),
+        (_AVAILABLE_PATTERNS, "available", True),
     ):
-        found = find_match(patterns, texts_by_source_key)
+        found = find_match(patterns, texts_by_source_key, skip_forward_looking=skip_future)
         if found:
             source_key, quote, char_start, char_end = found
             return ResidencyAssessment(
