@@ -11,7 +11,13 @@ from app.models.provider import Provider
 from app.models.source import Source
 from app.models.source_observation import SourceObservation
 from app.tracker.fetch import FetchResult
-from app.tracker.run import check_source, due_sources, freshness_state, reevaluate_product_residency
+from app.tracker.run import (
+    check_source,
+    due_sources,
+    freshness_state,
+    reevaluate_product_residency,
+    run_due_checks,
+)
 from app.tracker.seed_sources import upsert_seed_registry
 
 
@@ -230,15 +236,46 @@ def test_freshness_state_transitions() -> None:
             source.next_check_at = now - timedelta(minutes=1)
             assert freshness_state(source, now) == "due"
 
+            # Failing right now, but the captured content is still recent
+            # enough to trust.
+            source.backoff_until = now + timedelta(minutes=5)
+            assert freshness_state(source, now) == "blocked"
+
             source.max_healthy_age_seconds = 60
             source.last_success_at = now - timedelta(minutes=5)
             assert freshness_state(source, now) == "stale"
 
-            source.backoff_until = now + timedelta(minutes=5)
-            assert freshness_state(source, now) == "blocked"
-
             source.enabled = False
             assert freshness_state(source, now) == "disabled"
+        finally:
+            _cleanup(db, provider_id)
+
+
+def test_permanently_failing_source_reports_stale_not_blocked() -> None:
+    """Backoff caps at six hours, so a source that has been 404ing for months
+    is always inside a backoff window. Reporting that as merely "blocked" hid
+    the thing that matters — the content the verdict rests on is ancient — and
+    gave a permanent failure the same amber dot as a source that failed once an
+    hour ago.
+    """
+    with SessionLocal() as db:
+        source = _make_provider_source(db)
+        db.commit()
+        provider_id = source.provider_id
+
+        try:
+            now = datetime.now(timezone.utc)
+            # 400 days of failure: last success long past max_healthy_age, and
+            # still in the (capped) backoff window as it always will be.
+            source.last_success_at = now - timedelta(days=400)
+            source.failure_count = 1600
+            source.backoff_until = now + timedelta(hours=6)
+            assert freshness_state(source, now) == "stale"
+
+            # A transient failure on a recently-captured source is still just
+            # "blocked" — this must not turn every retry into an alarm.
+            source.last_success_at = now - timedelta(hours=1)
+            assert freshness_state(source, now) == "blocked"
         finally:
             _cleanup(db, provider_id)
 
@@ -390,3 +427,102 @@ def test_seed_registry_upsert_is_idempotent() -> None:
         slugs = {p.slug for p in provider_rows}
         assert "openai" in slugs
         assert "anthropic" in slugs
+
+
+def test_check_source_handles_content_reverting_to_a_previous_version() -> None:
+    """Vendors revert wording all the time: a residency claim is added, pulled,
+    then reinstated. The reappearing content is a legitimate third version of
+    the timeline — it used to collide with its own earlier row under
+    UNIQUE(source_id, normalized_sha256) and raise IntegrityError, which aborted
+    the whole scheduler tick.
+    """
+    a = "<main><p>Data is processed in the EU.</p></main>"
+    b = "<main><p>Data is processed globally.</p></main>"
+
+    with SessionLocal() as db:
+        source = _make_provider_source(db)
+        db.commit()
+        provider_id = source.provider_id
+
+        try:
+            for body in (a, b, a):
+                check_source(db, source, FakeFetcher([_success_result(body)]))
+
+            versions = db.execute(
+                select(DocumentVersion)
+                .where(DocumentVersion.source_id == source.id)
+                .order_by(DocumentVersion.created_at, DocumentVersion.id)
+            ).scalars().all()
+            assert len(versions) == 3, "A -> B -> A is three real versions"
+            assert versions[0].normalized_sha256 == versions[2].normalized_sha256
+            # The history stays linked, so the revert is auditable as a revert.
+            assert versions[1].predecessor_id == versions[0].id
+            assert versions[2].predecessor_id == versions[1].id
+        finally:
+            _cleanup(db, provider_id)
+
+
+def test_run_due_checks_isolates_one_failing_source_from_the_rest() -> None:
+    """A source that raises unexpectedly (parser blow-up, constraint violation)
+    used to abort the entire tick, so sources queued behind it were never
+    fetched — and since _mark_success never ran it stayed due and killed every
+    later tick the same way. One bad page silently froze the tracker.
+    """
+
+    class PoisonFetcher:
+        def __init__(self, poison_url: str) -> None:
+            self.poison_url = poison_url
+            self.calls: list[str] = []
+
+        def fetch(self, request) -> FetchResult:
+            self.calls.append(request.url)
+            if request.url == self.poison_url:
+                raise ValueError("normalizer exploded on pathological markup")
+            return _success_result(f"<main><p>Healthy {request.url}</p></main>")
+
+    poison_url = "https://poison.test/docs"
+    provider_ids = []
+    with SessionLocal() as db:
+        # Only this test's sources should be due.
+        db.execute(Source.__table__.update().values(enabled=False))
+        db.commit()
+
+        for offset, url in enumerate([poison_url, "https://ok1.test/docs"]):
+            source = _make_provider_source(db)
+            source.canonical_url = url
+            # Poison source is due first, so a naive implementation dies before
+            # ever reaching the healthy one.
+            source.next_check_at = datetime.now(timezone.utc) - timedelta(hours=2 - offset)
+            db.commit()
+            provider_ids.append(source.provider_id)
+
+    try:
+        with SessionLocal() as db:
+            fetcher = PoisonFetcher(poison_url)
+            outcomes = run_due_checks(db, fetcher=fetcher)
+
+            assert fetcher.calls == [poison_url, "https://ok1.test/docs"]
+            assert len(outcomes) == 1, "only the healthy source yields an outcome"
+
+            healthy = db.execute(
+                select(Source).where(Source.canonical_url == "https://ok1.test/docs")
+            ).scalars().one()
+            assert healthy.last_success_at is not None
+
+            poisoned = db.execute(
+                select(Source).where(Source.canonical_url == poison_url)
+            ).scalars().one()
+            # Backed off like any other failure, so it stops being retried
+            # every tick instead of wedging the scheduler.
+            assert poisoned.failure_count == 1
+            assert poisoned.backoff_until is not None
+            observations = db.execute(
+                select(SourceObservation).where(SourceObservation.source_id == poisoned.id)
+            ).scalars().all()
+            assert [o.error_class for o in observations] == ["unexpected:ValueError"]
+    finally:
+        with SessionLocal() as db:
+            for provider_id in provider_ids:
+                _cleanup(db, provider_id)
+            db.execute(Source.__table__.update().values(enabled=True))
+            db.commit()
