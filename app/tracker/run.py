@@ -38,17 +38,25 @@ def due_sources(db: Session, limit: int = 1000) -> list[Source]:
 
 def freshness_state(source: Source, now: datetime | None = None) -> str:
     """Derived, not stored - avoids a state machine that can drift out of
-    sync with last_success_at/backoff_until."""
+    sync with last_success_at/backoff_until.
+
+    Staleness is checked before backoff, deliberately. Backoff caps at six
+    hours, so a source that has been failing for months is *always* sitting in
+    a backoff window when this is called - reporting it as merely "blocked"
+    hid the thing that actually matters, which is that the captured content is
+    ancient and the verdict resting on it can no longer be trusted. A
+    permanent 404 used to show the same amber dot as a source that failed once
+    an hour ago, forever.
+    """
     now = now or datetime.now(timezone.utc)
     if not source.enabled:
         return "disabled"
+    if source.last_success_at is None or (
+        (now - source.last_success_at).total_seconds() > source.max_healthy_age_seconds
+    ):
+        return "stale"
     if source.backoff_until and source.backoff_until > now:
         return "blocked"
-    if source.last_success_at is None:
-        return "stale"
-    age = (now - source.last_success_at).total_seconds()
-    if age > source.max_healthy_age_seconds:
-        return "stale"
     if source.next_check_at <= now:
         return "due"
     return "fresh"
@@ -58,7 +66,10 @@ def _latest_document_version(db: Session, source_id) -> DocumentVersion | None:
     stmt = (
         select(DocumentVersion)
         .where(DocumentVersion.source_id == source_id)
-        .order_by(DocumentVersion.created_at.desc())
+        # created_at alone can tie (two versions captured in the same
+        # instant), and which row wins here decides a product's residency
+        # verdict - so break the tie on the id for a stable answer.
+        .order_by(DocumentVersion.created_at.desc(), DocumentVersion.id.desc())
         .limit(1)
     )
     return db.execute(stmt).scalars().first()
@@ -279,11 +290,47 @@ def _record_failure(
 
 
 def run_due_checks(db: Session, fetcher: HttpFetcher | None = None, limit: int = 1000) -> list[CheckOutcome]:
+    """Checks every due source, isolating each one.
+
+    check_source already handles the *expected* failures (HTTP errors become
+    observations with backoff). This guards the unexpected ones - a parser
+    blowing up, a constraint violation, a classifier raising on pathological
+    content. Previously a single such source aborted the whole tick, so the
+    sources queued behind it were never fetched at all; and because
+    _mark_success never ran, the offending source stayed due and killed every
+    subsequent tick the same way. One bad page silently froze the tracker.
+    """
     owns_fetcher = fetcher is None
     fetcher = fetcher or HttpFetcher()
+    outcomes: list[CheckOutcome] = []
     try:
-        outcomes = [check_source(db, source, fetcher) for source in due_sources(db, limit=limit)]
+        for source in due_sources(db, limit=limit):
+            try:
+                outcomes.append(check_source(db, source, fetcher))
+            except Exception as exc:  # noqa: BLE001 - deliberately broad, see docstring
+                # The session is likely dirty (mid-flush IntegrityError), so
+                # reset it before touching the next source.
+                db.rollback()
+                _record_unexpected_failure(db, source, exc)
     finally:
         if owns_fetcher:
             fetcher.close()
     return outcomes
+
+
+def _record_unexpected_failure(db: Session, source: Source, exc: Exception) -> None:
+    """Applies the same backoff an HTTP failure gets, so a source that raises
+    is visible in the observation log and stops being retried every tick
+    instead of wedging the scheduler. Failing to even record this must not
+    itself abort the run, hence the inner guard."""
+    try:
+        _record_failure(
+            db,
+            source,
+            datetime.now(timezone.utc),
+            f"unexpected:{type(exc).__name__}",
+            str(exc),
+            None,
+        )
+    except Exception:  # noqa: BLE001
+        db.rollback()
