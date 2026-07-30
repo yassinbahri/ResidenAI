@@ -78,6 +78,65 @@ def test_negation_does_not_hide_a_later_genuine_match() -> None:
     assert result.status == "available"
 
 
+def test_roadmap_promise_is_not_read_as_present_availability() -> None:
+    # "We plan to offer data residency in the EU" contains the exact wording the
+    # availability patterns look for, but the vendor has not shipped it -
+    # recording it as "available" overstates compliance.
+    result = classify_eu_eea_residency(
+        {"faq": "We plan to offer data residency in the EU in 2027."}
+    )
+    assert result.status == "unclear"
+
+
+def test_coming_soon_qualifier_after_the_claim_is_caught() -> None:
+    # The cue can follow the claim rather than precede it.
+    result = classify_eu_eea_residency(
+        {"changelog": "EU data residency in the EU is coming soon and is not yet available."}
+    )
+    assert result.status == "unclear"
+
+
+def test_roadmap_promise_does_not_make_a_product_selectable() -> None:
+    result = classify_eu_eea_residency(
+        {"docs": "We are working on letting customers choose Europe as their data zone."}
+    )
+    assert result.status == "unclear"
+
+
+def test_present_tense_claim_survives_unrelated_roadmap_talk_nearby() -> None:
+    # The forward-looking filter is clause-scoped: a roadmap sentence sitting
+    # next to a genuine present-tense claim must not suppress it, or the filter
+    # would erase real findings (vendor pages routinely pair the two).
+    for text in (
+        "Data is stored in the EU region today. We will be adding more regions soon.",
+        "We offer EU data residency. Additional certifications are on our roadmap.",
+        "All processing is hosted in the EU. Support for Asia is coming soon.",
+        "EU region is available now; we plan to add Canada later.",
+    ):
+        result = classify_eu_eea_residency({"docs": text})
+        assert result.status == "available", text
+
+
+def test_forward_looking_denial_still_counts_as_not_available() -> None:
+    # Only positive claims are filtered - a denial is a denial whatever its
+    # tense, and must not be softened into "unclear".
+    result = classify_eu_eea_residency(
+        {"faq": "This product will not be available in the EU."}
+    )
+    assert result.status == "not_available"
+
+
+def test_never_available_is_a_denial_not_an_availability_claim() -> None:
+    # "will never be available in Europe" contains "available in Europe", so the
+    # denial patterns not covering "never" meant the positive pattern claimed it
+    # first and reported AVAILABLE - inverting an explicit refusal into a
+    # compliance claim, the worst possible direction to be wrong in.
+    result = classify_eu_eea_residency(
+        {"faq": "This capability will never be available in Europe."}
+    )
+    assert result.status == "not_available"
+
+
 def test_evidence_quote_includes_surrounding_context() -> None:
     text = "Some preamble text. " + "x" * 50 + " EU region is supported for storage. " + "y" * 50
     result = classify_eu_eea_residency({"docs": text})

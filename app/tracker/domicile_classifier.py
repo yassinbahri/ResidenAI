@@ -90,7 +90,20 @@ _EU_DOMICILE_PATTERNS = [
     ),
     re.compile(rf"is\s+an?\s+\w*\s*(?:{_EU_EEA_COUNTRIES})\s+(?:company|corporation|entity)\b", re.I),
     # Societas Europaea - an EU-only legal form, unambiguous on its own.
-    re.compile(r"\b\w+\s+SE\b(?:,|\.|\s+is\b)", re.U),
+    #
+    # Requires a capitalized preceding word and rejects a preceding street-type
+    # word: "SE" is also the standard US quadrant abbreviation, so the bare
+    # `\w+\s+SE` shape matched "1201 Broad Street SE, Atlanta, Georgia" and
+    # classified US vendors as eu_domiciled off their own postal address - the
+    # exact overstatement-of-compliance failure this module is built to avoid.
+    # The negative lookahead keeps genuine names ("DeepL SE,") matching while
+    # dropping the address shape ("Street SE,", "St SE,", "Ave SE.").
+    re.compile(
+        r"\b(?!(?:Street|St|Avenue|Ave|Boulevard|Blvd|Road|Rd|Drive|Dr|Lane|Ln|"
+        r"Court|Ct|Place|Pl|Terrace|Ter|Way|Highway|Hwy|Parkway|Pkwy|Suite|Ste)\b)"
+        r"[A-Z][\w.&-]*\s+SE\b(?:,|\.|\s+is\b)",
+        re.U,
+    ),
 ]
 
 # A company's own VAT number or national registry reference on its own page
